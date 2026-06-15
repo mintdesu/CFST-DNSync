@@ -84,11 +84,42 @@ if [ -f "$LOG_FILE" ]; then
     fi
 fi
 
+CF_API_RETRIES=3
+CF_API_RETRY_DELAY=5
+
 cf_api() {
     local method="$1" endpoint="$2" data="$3"
-    local args=(-s -X "$method" -H "Authorization: Bearer ${CF_API_TOKEN}" -H "Content-Type: application/json")
+    local args=(-s -w "\n%{http_code}" -X "$method" -H "Authorization: Bearer ${CF_API_TOKEN}" -H "Content-Type: application/json")
     [ -n "$data" ] && args+=(-d "$data")
-    curl "${args[@]}" "https://api.cloudflare.com/client/v4${endpoint}"
+
+    local attempt=1 resp body http_code
+    while [ "$attempt" -le "$CF_API_RETRIES" ]; do
+        resp=$(curl "${args[@]}" "https://api.cloudflare.com/client/v4${endpoint}")
+        http_code=$(echo "$resp" | tail -1)
+        body=$(echo "$resp" | sed '$d')
+
+        if echo "$http_code" | grep -qE '^[23]'; then
+            echo "$body"
+            return 0
+        fi
+
+        # 4xx (非429) 客户端错误不重试
+        if echo "$http_code" | grep -qE '^4[0-9]{2}$' && [ "$http_code" != "429" ]; then
+            echo "$body"
+            return 0
+        fi
+
+        # 429 / 5xx / 网络失败 (空或000) 都重试
+        if [ "$attempt" -lt "$CF_API_RETRIES" ]; then
+            local wait=$((CF_API_RETRY_DELAY * attempt))
+            show "[WARN] API ${method} ${endpoint} 返回 ${http_code:-超时}, ${wait}s 后重试 (${attempt}/${CF_API_RETRIES})"
+            sleep "$wait"
+        fi
+
+        attempt=$((attempt + 1))
+    done
+
+    echo "$body"
 }
 
 # ──────────────────── DNS 更新函数 ────────────────────────
