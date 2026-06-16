@@ -16,12 +16,6 @@ CF_TTL=60
 # true = 只测速写入log和csv, 不操作DNS, 用于观察测速结果
 DRY_RUN=false
 
-# ──────────────────── 质量门槛 ─────────────────────────────
-# 测速结果必须同时满足以下条件才会写入DNS, 不达标的直接丢弃
-# 设为 0 表示不限制
-MIN_SPEED=0        # 最低下载速度 (MB/s), 低于此值的IP不解析
-MAX_LATENCY=0      # 最高平均延迟 (ms), 高于此值的IP不解析
-
 # ──────────────────── 模式选择 ─────────────────────────────
 # mix    = 混搭模式, 不管地区, 速度最快的直接全部解析到一个域名
 # region = 分流模式, 按地区拆分到不同子域名, 每个地区单独测速
@@ -29,8 +23,11 @@ MODE="region"
 
 # ──────────────────── mix 模式配置 ─────────────────────────
 MIX_SUBDOMAIN="cf-cdn.example.com"    # 全部IP解析到这个子域名
-MIX_TOP_N=15                          # 取速度最快的前N个
-MIX_CFST_ARGS="-n 200 -t 4 -dn 40 -dt 10 -p 40 -sl 0.01 -tl 200"  # TCPing 模式参数
+MIX_TOP_N=15                          # 取速度最快的前N个写入DNS
+MIX_SCAN_COUNT=40                     # 常规扫描测试数量, 应 >= MIX_TOP_N
+MIX_MIN_SPEED=0                       # 最低下载速度 (MB/s), 0=不限
+MIX_MAX_LATENCY=0                     # 最高平均延迟 (ms), 0=不限
+MIX_CFST_ARGS="-n 200 -t 4 -dt 10 -tp 0.05 -sl 0.01 -tl 200"  # TCPing 模式参数
 
 # ──────────────────── region 模式配置 ──────────────────────
 # 格式: "地区码:子域名:取前N个"
@@ -54,9 +51,12 @@ REGION_MAP=(
     # "FRA:cf-cdn-eu.example.com:10"
 )
 
-# -httping / -cfcolo / -dn / -p 由脚本根据 REGION_MAP 自动拼接, 不要手动写在这里
-# 实际执行: cfst $REGION_CFST_ARGS -httping -cfcolo NRT -dn 10 -p 10
-REGION_CFST_ARGS="-n 200 -t 4 -dt 10 -sl 0.01 -tl 200"  # HTTPing 模式公共参数
+# -httping / -cfcolo / -dn / -p 由脚本自动拼接, 不要手动写在 REGION_CFST_ARGS 里
+# 实际执行: cfst $REGION_CFST_ARGS -httping -cfcolo NRT -dn $REGION_SCAN_COUNT -p $REGION_SCAN_COUNT
+REGION_CFST_ARGS="-n 200 -t 4 -dt 10 -tp 0.05 -sl 0.01 -tl 200"  # HTTPing 模式公共参数
+REGION_SCAN_COUNT=20    # 常规扫描测试数量, 应 >= REGION_MAP 中的 TOP_N
+REGION_MIN_SPEED=0      # 最低下载速度 (MB/s), 0=不限
+REGION_MAX_LATENCY=0    # 最高平均延迟 (ms), 0=不限
 REGION_SLEEP=120        # 每个地区测速之间等待秒数, 降低 HTTPing 被限速的风险
 REGION_CACHE_SLEEP=30   # 常规扫描与IP库对比之间的等待秒数
 REGION_CACHE_MAX=100    # 每个地区IP库最大缓存数
@@ -286,9 +286,14 @@ show ""
 show "================================================="
 show "  CFST-DNSync - $(date '+%Y-%m-%d %H:%M:%S')"
 show "  Mode: ${MODE}"
+if [ "$MODE" = "mix" ]; then
+    _MIN_SPD="$MIX_MIN_SPEED"; _MAX_LAT="$MIX_MAX_LATENCY"
+else
+    _MIN_SPD="$REGION_MIN_SPEED"; _MAX_LAT="$REGION_MAX_LATENCY"
+fi
 GATE_INFO=""
-[ "$MIN_SPEED" != "0" ] && GATE_INFO="speed>=${MIN_SPEED}MB/s"
-[ "$MAX_LATENCY" != "0" ] && GATE_INFO="${GATE_INFO:+${GATE_INFO} }latency<=${MAX_LATENCY}ms"
+[ "$_MIN_SPD" != "0" ] && GATE_INFO="speed>=${_MIN_SPD}MB/s"
+[ "$_MAX_LAT" != "0" ] && GATE_INFO="${GATE_INFO:+${GATE_INFO} }latency<=${_MAX_LAT}ms"
 [ -n "$GATE_INFO" ] && show "  Filter: ${GATE_INFO}"
 [ "$DRY_RUN" = "true" ] && show "  *** DRY RUN - 观察模式, 不操作DNS ***"
 show "================================================="
@@ -323,7 +328,7 @@ if [ "$MODE" = "mix" ]; then
     show "[INFO] 开始测速 (TCPing)..."
 
     # shellcheck disable=SC2086
-    "$CFST_BIN" $MIX_CFST_ARGS -o "$RESULT_FILE" -f "$IP_FILE" 2>&1
+    "$CFST_BIN" $MIX_CFST_ARGS -dn "$MIX_SCAN_COUNT" -p "$MIX_SCAN_COUNT" -o "$RESULT_FILE" -f "$IP_FILE" 2>&1
     CFST_EXIT=$?
 
     if [ $CFST_EXIT -ne 0 ] || [ ! -s "$RESULT_FILE" ]; then
@@ -334,7 +339,7 @@ if [ "$MODE" = "mix" ]; then
 
     # 取前N个IP (过滤后, 含质量门槛)
     MIX_IPS="${SCRIPT_DIR}/.ips_mix.tmp"
-    tail -n +2 "$RESULT_FILE" | awk -F',' -v min_spd="$MIN_SPEED" -v max_lat="$MAX_LATENCY" '{
+    tail -n +2 "$RESULT_FILE" | awk -F',' -v min_spd="$MIX_MIN_SPEED" -v max_lat="$MIX_MAX_LATENCY" '{
         speed=$6; latency=$5; region=$7;
         gsub(/ /,"",speed); gsub(/ /,"",latency); gsub(/ /,"",region);
         if (speed+0 <= 0 || region == "N/A") next;
@@ -370,7 +375,7 @@ else
         show "[INFO] [${REGION_INDEX}/${REGION_TOTAL}] 测速 ${REGION} - 常规扫描 (HTTPing -cfcolo ${REGION})..."
 
         # shellcheck disable=SC2086
-        "$CFST_BIN" $REGION_CFST_ARGS -httping -cfcolo "$REGION" -dn "$TOP_N" -p "$TOP_N" -o "$RESULT_FILE" -f "$IP_FILE" 2>&1
+        "$CFST_BIN" $REGION_CFST_ARGS -httping -cfcolo "$REGION" -dn "$REGION_SCAN_COUNT" -p "$REGION_SCAN_COUNT" -o "$RESULT_FILE" -f "$IP_FILE" 2>&1
         CFST_EXIT=$?
 
         NORMAL_OK=false
@@ -458,7 +463,7 @@ else
 
         # 提取IP (含质量门槛)
         REGION_IPS="${SCRIPT_DIR}/.ips_${REGION}.tmp"
-        tail -n +2 "$FINAL_CSV" | awk -F',' -v min_spd="$MIN_SPEED" -v max_lat="$MAX_LATENCY" '{
+        tail -n +2 "$FINAL_CSV" | awk -F',' -v min_spd="$REGION_MIN_SPEED" -v max_lat="$REGION_MAX_LATENCY" '{
             speed=$6; latency=$5; region=$7;
             gsub(/ /,"",speed); gsub(/ /,"",latency); gsub(/ /,"",region);
             if (speed+0 <= 0 || region == "N/A") next;
@@ -467,9 +472,14 @@ else
             print $1
         }' | sed 's/ //g' | head -n "$TOP_N" > "$REGION_IPS"
 
+        FINAL_N=$(wc -l < "$REGION_IPS" | tr -d ' ')
+        if [ "$FINAL_N" -lt "$TOP_N" ]; then
+            show "[WARN] ${REGION} 仅获得 ${FINAL_N}/${TOP_N} 个IP, 未填满DNS上限, 可增大 REGION_SCAN_COUNT 扩大常规扫描范围, 增大 REGION_CACHE_TOP_N 让更多缓存IP参与对比, 或放宽 REGION_MIN_SPEED / REGION_MAX_LATENCY 质量门槛"
+        fi
+
         # 更新IP库: 所有过门槛IP带延迟+带宽入库, 去重保留高速, 排序截断
         NEW_CACHE="${SCRIPT_DIR}/.cache_new_${REGION}.tmp"
-        tail -n +2 "$FINAL_CSV" | awk -F',' -v min_spd="$MIN_SPEED" -v max_lat="$MAX_LATENCY" '{
+        tail -n +2 "$FINAL_CSV" | awk -F',' -v min_spd="$REGION_MIN_SPEED" -v max_lat="$REGION_MAX_LATENCY" '{
             ip=$1; lat=$5; spd=$6; rgn=$7
             gsub(/ /,"",ip); gsub(/ /,"",lat); gsub(/ /,"",spd); gsub(/ /,"",rgn)
             if (spd+0 <= 0 || rgn == "N/A") next
