@@ -60,6 +60,7 @@ REGION_MAX_LATENCY=0       # 最高平均延迟 (ms), 0=不限
 REGION_SLEEP=120           # 每个地区测速之间等待秒数, 降低 HTTPing 被限速的风险
 
 # ──────────────────── region IP库缓存 ─────────────────────
+REGION_CACHE_ENABLED=true  # 是否启用region IP库缓存
 REGION_CACHE_MAX=100       # 每个地区IP库最大缓存数
 REGION_CACHE_TOP_N=10      # 每次从IP库取前N个做对比测速
 REGION_CACHE_SORT="speed"  # IP库排序方式: speed(带宽优先) 或 latency(延迟优先)
@@ -316,6 +317,9 @@ if [ "$DRY_RUN" != "true" ]; then
         die "无法获取 Zone ID, 请检查 CF_DOMAIN 和 API Token"
     fi
     show "[INFO] Zone ID: ${CF_ZONE_ID}"
+else
+    show ""
+    show "[INFO] DRY RUN: 跳过 Cloudflare Zone ID 查询"
 fi
 
 # ══════════════════════════════════════════════════════════
@@ -358,7 +362,7 @@ if [ "$MODE" = "mix" ]; then
 # ══════════════════════════════════════════════════════════
 else
 
-    mkdir -p "$CACHE_DIR"
+    [ "$REGION_CACHE_ENABLED" = "true" ] && mkdir -p "$CACHE_DIR"
     REGION_INDEX=0
     REGION_TOTAL=${#REGION_MAP[@]}
 
@@ -391,7 +395,7 @@ else
         # ── Pass 2: IP库对比测速 ──
         CACHE_OK=false
         CACHE_INPUT="${SCRIPT_DIR}/.cache_input_${REGION}.tmp"
-        if [ -f "$CACHE_FILE" ] && [ -s "$CACHE_FILE" ]; then
+        if [ "$REGION_CACHE_ENABLED" = "true" ] && [ -f "$CACHE_FILE" ] && [ -s "$CACHE_FILE" ]; then
             CACHE_TOTAL=$(wc -l < "$CACHE_FILE" | tr -d ' ')
             if [ "$REGION_CACHE_SORT" = "latency" ]; then
                 sort -t',' -k2 -n "$CACHE_FILE" | head -n "$REGION_CACHE_TOP_N" | cut -d',' -f1 > "$CACHE_INPUT"
@@ -479,31 +483,33 @@ else
             show "[WARN] ${REGION} 仅获得 ${FINAL_N}/${TOP_N} 个IP, 未填满DNS上限, 可增大 REGION_SCAN_COUNT 扩大常规扫描范围, 增大 REGION_CACHE_TOP_N 让更多缓存IP参与对比, 或放宽 REGION_MIN_SPEED / REGION_MAX_LATENCY 质量门槛"
         fi
 
-        # 更新IP库: 所有过门槛IP带延迟+带宽入库, 去重保留高速, 排序截断
-        NEW_CACHE="${SCRIPT_DIR}/.cache_new_${REGION}.tmp"
-        tail -n +2 "$FINAL_CSV" | awk -F',' -v min_spd="$REGION_MIN_SPEED" -v max_lat="$REGION_MAX_LATENCY" '{
-            ip=$1; lat=$5; spd=$6; rgn=$7
-            gsub(/ /,"",ip); gsub(/ /,"",lat); gsub(/ /,"",spd); gsub(/ /,"",rgn)
-            if (spd+0 <= 0 || rgn == "N/A") next
-            if (min_spd+0 > 0 && spd+0 < min_spd+0) next
-            if (max_lat+0 > 0 && lat+0 > max_lat+0) next
-            print ip "," lat "," spd
-        }' > "$NEW_CACHE"
+        if [ "$REGION_CACHE_ENABLED" = "true" ]; then
+            # 更新IP库: 所有过门槛IP带延迟+带宽入库, 去重保留高速, 排序截断
+            NEW_CACHE="${SCRIPT_DIR}/.cache_new_${REGION}.tmp"
+            tail -n +2 "$FINAL_CSV" | awk -F',' -v min_spd="$REGION_MIN_SPEED" -v max_lat="$REGION_MAX_LATENCY" '{
+                ip=$1; lat=$5; spd=$6; rgn=$7
+                gsub(/ /,"",ip); gsub(/ /,"",lat); gsub(/ /,"",spd); gsub(/ /,"",rgn)
+                if (spd+0 <= 0 || rgn == "N/A") next
+                if (min_spd+0 > 0 && spd+0 < min_spd+0) next
+                if (max_lat+0 > 0 && lat+0 > max_lat+0) next
+                print ip "," lat "," spd
+            }' > "$NEW_CACHE"
 
-        if [ -s "$NEW_CACHE" ]; then
-            {
-                cat "$NEW_CACHE"
-                [ -f "$CACHE_FILE" ] && cat "$CACHE_FILE"
-            } | awk -F',' '{
-                ip=$1; spd=$3+0
-                if (!(ip in best) || spd > best[ip]+0) { best[ip]=spd; line[ip]=$0 }
-            } END { for (ip in best) print line[ip] }' | \
-            sort -t',' -k3 -rn | head -n "$REGION_CACHE_MAX" > "${CACHE_FILE}.tmp"
-            mv "${CACHE_FILE}.tmp" "$CACHE_FILE"
-            CACHE_TOTAL=$(wc -l < "$CACHE_FILE" | tr -d ' ')
-            show "[INFO] IP库已更新: ${CACHE_TOTAL} 个IP (${REGION})"
+            if [ -s "$NEW_CACHE" ]; then
+                {
+                    cat "$NEW_CACHE"
+                    [ -f "$CACHE_FILE" ] && cat "$CACHE_FILE"
+                } | awk -F',' '{
+                    ip=$1; spd=$3+0
+                    if (!(ip in best) || spd > best[ip]+0) { best[ip]=spd; line[ip]=$0 }
+                } END { for (ip in best) print line[ip] }' | \
+                sort -t',' -k3 -rn | head -n "$REGION_CACHE_MAX" > "${CACHE_FILE}.tmp"
+                mv "${CACHE_FILE}.tmp" "$CACHE_FILE"
+                CACHE_TOTAL=$(wc -l < "$CACHE_FILE" | tr -d ' ')
+                show "[INFO] IP库已更新: ${CACHE_TOTAL} 个IP (${REGION})"
+            fi
+            rm -f "$NEW_CACHE"
         fi
-        rm -f "$NEW_CACHE"
 
         update_dns "$REGION" "$SUBDOMAIN" "$REGION_IPS"
         rm -f "$REGION_IPS" "$RESULT_CACHE" "$RESULT_MERGED"
