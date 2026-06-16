@@ -54,14 +54,16 @@ REGION_MAP=(
 # -httping / -cfcolo / -dn / -p 由脚本自动拼接, 不要手动写在 REGION_CFST_ARGS 里
 # 实际执行: cfst $REGION_CFST_ARGS -httping -cfcolo NRT -dn $REGION_SCAN_COUNT -p $REGION_SCAN_COUNT
 REGION_CFST_ARGS="-n 200 -t 4 -dt 10 -tp 0.05 -sl 0.01 -tl 200"  # HTTPing 模式公共参数
-REGION_SCAN_COUNT=20    # 常规扫描测试数量, 应 >= REGION_MAP 中的 TOP_N
-REGION_MIN_SPEED=0      # 最低下载速度 (MB/s), 0=不限
-REGION_MAX_LATENCY=0    # 最高平均延迟 (ms), 0=不限
-REGION_SLEEP=120        # 每个地区测速之间等待秒数, 降低 HTTPing 被限速的风险
-REGION_CACHE_SLEEP=30   # 常规扫描与IP库对比之间的等待秒数
-REGION_CACHE_MAX=100    # 每个地区IP库最大缓存数
-REGION_CACHE_TOP_N=10   # 每次从IP库取前N个做对比测速
+REGION_SCAN_COUNT=20       # 常规扫描测试数量, 应 >= REGION_MAP 中的 TOP_N
+REGION_MIN_SPEED=0         # 最低下载速度 (MB/s), 0=不限
+REGION_MAX_LATENCY=0       # 最高平均延迟 (ms), 0=不限
+REGION_SLEEP=120           # 每个地区测速之间等待秒数, 降低 HTTPing 被限速的风险
+
+# ──────────────────── region IP库缓存 ─────────────────────
+REGION_CACHE_MAX=100       # 每个地区IP库最大缓存数
+REGION_CACHE_TOP_N=10      # 每次从IP库取前N个做对比测速
 REGION_CACHE_SORT="speed"  # IP库排序方式: speed(带宽优先) 或 latency(延迟优先)
+REGION_CACHE_SLEEP=30      # 常规扫描与IP库对比之间的等待秒数
 
 # ============================================================================
 # 以下内容无需修改
