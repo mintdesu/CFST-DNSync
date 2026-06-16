@@ -57,7 +57,11 @@ REGION_MAP=(
 # -httping / -cfcolo / -dn / -p 由脚本根据 REGION_MAP 自动拼接, 不要手动写在这里
 # 实际执行: cfst $REGION_CFST_ARGS -httping -cfcolo NRT -dn 10 -p 10
 REGION_CFST_ARGS="-n 200 -t 4 -dt 10 -sl 0.01 -tl 200"  # HTTPing 模式公共参数
-REGION_SLEEP=120   # 每个地区测速之间等待秒数, 降低 HTTPing 被限速的风险
+REGION_SLEEP=120        # 每个地区测速之间等待秒数, 降低 HTTPing 被限速的风险
+REGION_CACHE_SLEEP=30   # 常规扫描与IP库对比之间的等待秒数
+REGION_CACHE_MAX=100    # 每个地区IP库最大缓存数
+REGION_CACHE_TOP_N=10   # 每次从IP库取前N个做对比测速
+REGION_CACHE_SORT="speed"  # IP库排序方式: speed(带宽优先) 或 latency(延迟优先)
 
 # ============================================================================
 # 以下内容无需修改
@@ -67,6 +71,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CFST_BIN="${SCRIPT_DIR}/cfst"
 IP_FILE="${SCRIPT_DIR}/ip.txt"
 LOG_FILE="${SCRIPT_DIR}/cfst_update.log"
+CACHE_DIR="${SCRIPT_DIR}/cache"
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE"; }
 show() { echo "$*"; echo "$*" >> "$LOG_FILE"; }
@@ -294,16 +299,17 @@ show "================================================="
 
 cd "$SCRIPT_DIR" || die "无法进入工作目录"
 
-# 通过根域名查询 Zone ID
-show ""
-show "[INFO] 查询 ${CF_DOMAIN} 的 Zone ID..."
-ZONE_RESP=$(cf_api GET "/zones?name=${CF_DOMAIN}&status=active")
-CF_ZONE_ID=$(echo "$ZONE_RESP" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
+if [ "$DRY_RUN" != "true" ]; then
+    show ""
+    show "[INFO] 查询 ${CF_DOMAIN} 的 Zone ID..."
+    ZONE_RESP=$(cf_api GET "/zones?name=${CF_DOMAIN}&status=active")
+    CF_ZONE_ID=$(echo "$ZONE_RESP" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
 
-if [ -z "$CF_ZONE_ID" ]; then
-    die "无法获取 Zone ID, 请检查 CF_DOMAIN 和 API Token"
+    if [ -z "$CF_ZONE_ID" ]; then
+        die "无法获取 Zone ID, 请检查 CF_DOMAIN 和 API Token"
+    fi
+    show "[INFO] Zone ID: ${CF_ZONE_ID}"
 fi
-show "[INFO] Zone ID: ${CF_ZONE_ID}"
 
 # ══════════════════════════════════════════════════════════
 # mix 模式
@@ -345,6 +351,7 @@ if [ "$MODE" = "mix" ]; then
 # ══════════════════════════════════════════════════════════
 else
 
+    mkdir -p "$CACHE_DIR"
     REGION_INDEX=0
     REGION_TOTAL=${#REGION_MAP[@]}
 
@@ -353,42 +360,142 @@ else
         REGION_INDEX=$((REGION_INDEX + 1))
 
         RESULT_FILE="${SCRIPT_DIR}/result_${REGION}.csv"
-        rm -f "$RESULT_FILE"
+        RESULT_CACHE="${SCRIPT_DIR}/result_${REGION}_cache.csv"
+        RESULT_MERGED="${SCRIPT_DIR}/result_${REGION}_merged.csv"
+        CACHE_FILE="${CACHE_DIR}/${REGION}.txt"
+        rm -f "$RESULT_FILE" "$RESULT_CACHE" "$RESULT_MERGED"
 
+        # ── Pass 1: 常规全量扫描 ──
         show ""
-        show "[INFO] [${REGION_INDEX}/${REGION_TOTAL}] 测速 ${REGION} (HTTPing -cfcolo ${REGION})..."
+        show "[INFO] [${REGION_INDEX}/${REGION_TOTAL}] 测速 ${REGION} - 常规扫描 (HTTPing -cfcolo ${REGION})..."
 
-        # 自动拼接: -httping -cfcolo -dn -p
         # shellcheck disable=SC2086
         "$CFST_BIN" $REGION_CFST_ARGS -httping -cfcolo "$REGION" -dn "$TOP_N" -p "$TOP_N" -o "$RESULT_FILE" -f "$IP_FILE" 2>&1
         CFST_EXIT=$?
 
-        if [ $CFST_EXIT -ne 0 ] || [ ! -s "$RESULT_FILE" ]; then
-            show "[WARN] ${REGION} 测速失败或结果为空, exit: $CFST_EXIT"
-            # 传空文件给 update_dns, 触发清空旧记录逻辑
+        NORMAL_OK=false
+        if [ $CFST_EXIT -eq 0 ] && [ -s "$RESULT_FILE" ]; then
+            NORMAL_OK=true
+            show_results "$RESULT_FILE"
+        else
+            show "[WARN] ${REGION} 常规扫描失败或结果为空, exit: $CFST_EXIT"
+        fi
+
+        # ── Pass 2: IP库对比测速 ──
+        CACHE_OK=false
+        CACHE_INPUT="${SCRIPT_DIR}/.cache_input_${REGION}.tmp"
+        if [ -f "$CACHE_FILE" ] && [ -s "$CACHE_FILE" ]; then
+            CACHE_TOTAL=$(wc -l < "$CACHE_FILE" | tr -d ' ')
+            if [ "$REGION_CACHE_SORT" = "latency" ]; then
+                sort -t',' -k2 -n "$CACHE_FILE" | head -n "$REGION_CACHE_TOP_N" | cut -d',' -f1 > "$CACHE_INPUT"
+            else
+                sort -t',' -k3 -rn "$CACHE_FILE" | head -n "$REGION_CACHE_TOP_N" | cut -d',' -f1 > "$CACHE_INPUT"
+            fi
+            CACHE_N=$(wc -l < "$CACHE_INPUT" | tr -d ' ')
+
+            show ""
+            show "[INFO] [${REGION_INDEX}/${REGION_TOTAL}] 测速 ${REGION} - IP库对比 (库存${CACHE_TOTAL}, 取前${CACHE_N}测速, 按${REGION_CACHE_SORT}排序)..."
+            sleep "$REGION_CACHE_SLEEP"
+
+            # shellcheck disable=SC2086
+            "$CFST_BIN" $REGION_CFST_ARGS -httping -cfcolo "$REGION" -dn "$CACHE_N" -p "$CACHE_N" -o "$RESULT_CACHE" -f "$CACHE_INPUT" 2>&1
+            CFST_EXIT=$?
+
+            if [ $CFST_EXIT -eq 0 ] && [ -s "$RESULT_CACHE" ]; then
+                CACHE_OK=true
+                show_results "$RESULT_CACHE"
+            else
+                show "[WARN] ${REGION} IP库扫描失败, exit: $CFST_EXIT"
+            fi
+        fi
+        rm -f "$CACHE_INPUT"
+
+        # ── 合并结果, 按带宽排序末位淘汰 ──
+        if [ "$NORMAL_OK" = "false" ] && [ "$CACHE_OK" = "false" ]; then
             EMPTY_FILE="${SCRIPT_DIR}/.ips_empty.tmp"
             : > "$EMPTY_FILE"
             update_dns "$REGION" "$SUBDOMAIN" "$EMPTY_FILE"
             rm -f "$EMPTY_FILE"
-        else
-            show_results "$RESULT_FILE"
 
-            # 提取IP (含质量门槛)
-            REGION_IPS="${SCRIPT_DIR}/.ips_${REGION}.tmp"
-            tail -n +2 "$RESULT_FILE" | awk -F',' -v min_spd="$MIN_SPEED" -v max_lat="$MAX_LATENCY" '{
-                speed=$6; latency=$5; region=$7;
-                gsub(/ /,"",speed); gsub(/ /,"",latency); gsub(/ /,"",region);
-                if (speed+0 <= 0 || region == "N/A") next;
-                if (min_spd+0 > 0 && speed+0 < min_spd+0) next;
-                if (max_lat+0 > 0 && latency+0 > max_lat+0) next;
-                print $1
-            }' | sed 's/ //g' | head -n "$TOP_N" > "$REGION_IPS"
-
-            update_dns "$REGION" "$SUBDOMAIN" "$REGION_IPS"
-            rm -f "$REGION_IPS"
+            if [ "$REGION_INDEX" -lt "$REGION_TOTAL" ]; then
+                show "[INFO] 等待 ${REGION_SLEEP}s 后测速下一个地区..."
+                sleep "$REGION_SLEEP"
+            fi
+            continue
         fi
 
-        # 非最后一个地区, 等待一段时间再跑下一个
+        if [ "$NORMAL_OK" = "true" ] && [ "$CACHE_OK" = "true" ]; then
+            head -1 "$RESULT_FILE" > "$RESULT_MERGED"
+            {
+                tail -n +2 "$RESULT_FILE"
+                tail -n +2 "$RESULT_CACHE"
+            } | awk -F',' '{
+                ip=$1; gsub(/ /,"",ip);
+                speed=$6; gsub(/ /,"",speed);
+                if (!(ip in best) || speed+0 > best[ip]+0) {
+                    best[ip]=speed+0; line[ip]=$0
+                }
+            } END {
+                n=0
+                for (ip in best) { n++; ips[n]=ip; spd[n]=best[ip] }
+                for (i=1;i<=n;i++) for (j=i+1;j<=n;j++) {
+                    if (spd[j]>spd[i]) {
+                        t=spd[i];spd[i]=spd[j];spd[j]=t
+                        t=ips[i];ips[i]=ips[j];ips[j]=t
+                    }
+                }
+                for (i=1;i<=n;i++) print line[ips[i]]
+            }' >> "$RESULT_MERGED"
+            FINAL_CSV="$RESULT_MERGED"
+            show ""
+            show "--- 合并结果 (按带宽排序) ---"
+            show_results "$FINAL_CSV"
+        elif [ "$NORMAL_OK" = "true" ]; then
+            FINAL_CSV="$RESULT_FILE"
+        else
+            FINAL_CSV="$RESULT_CACHE"
+        fi
+
+        # 提取IP (含质量门槛)
+        REGION_IPS="${SCRIPT_DIR}/.ips_${REGION}.tmp"
+        tail -n +2 "$FINAL_CSV" | awk -F',' -v min_spd="$MIN_SPEED" -v max_lat="$MAX_LATENCY" '{
+            speed=$6; latency=$5; region=$7;
+            gsub(/ /,"",speed); gsub(/ /,"",latency); gsub(/ /,"",region);
+            if (speed+0 <= 0 || region == "N/A") next;
+            if (min_spd+0 > 0 && speed+0 < min_spd+0) next;
+            if (max_lat+0 > 0 && latency+0 > max_lat+0) next;
+            print $1
+        }' | sed 's/ //g' | head -n "$TOP_N" > "$REGION_IPS"
+
+        # 更新IP库: 所有过门槛IP带延迟+带宽入库, 去重保留高速, 排序截断
+        NEW_CACHE="${SCRIPT_DIR}/.cache_new_${REGION}.tmp"
+        tail -n +2 "$FINAL_CSV" | awk -F',' -v min_spd="$MIN_SPEED" -v max_lat="$MAX_LATENCY" '{
+            ip=$1; lat=$5; spd=$6; rgn=$7
+            gsub(/ /,"",ip); gsub(/ /,"",lat); gsub(/ /,"",spd); gsub(/ /,"",rgn)
+            if (spd+0 <= 0 || rgn == "N/A") next
+            if (min_spd+0 > 0 && spd+0 < min_spd+0) next
+            if (max_lat+0 > 0 && lat+0 > max_lat+0) next
+            print ip "," lat "," spd
+        }' > "$NEW_CACHE"
+
+        if [ -s "$NEW_CACHE" ]; then
+            {
+                cat "$NEW_CACHE"
+                [ -f "$CACHE_FILE" ] && cat "$CACHE_FILE"
+            } | awk -F',' '{
+                ip=$1; spd=$3+0
+                if (!(ip in best) || spd > best[ip]+0) { best[ip]=spd; line[ip]=$0 }
+            } END { for (ip in best) print line[ip] }' | \
+            sort -t',' -k3 -rn | head -n "$REGION_CACHE_MAX" > "${CACHE_FILE}.tmp"
+            mv "${CACHE_FILE}.tmp" "$CACHE_FILE"
+            CACHE_TOTAL=$(wc -l < "$CACHE_FILE" | tr -d ' ')
+            show "[INFO] IP库已更新: ${CACHE_TOTAL} 个IP (${REGION})"
+        fi
+        rm -f "$NEW_CACHE"
+
+        update_dns "$REGION" "$SUBDOMAIN" "$REGION_IPS"
+        rm -f "$REGION_IPS" "$RESULT_CACHE" "$RESULT_MERGED"
+
         if [ "$REGION_INDEX" -lt "$REGION_TOTAL" ]; then
             show "[INFO] 等待 ${REGION_SLEEP}s 后测速下一个地区..."
             sleep "$REGION_SLEEP"

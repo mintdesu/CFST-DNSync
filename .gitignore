@@ -1,7 +1,8 @@
 cfst
 ip.txt
-result.csv
+result*.csv
 top_ips.txt
+cache/
 *.log
 *.tmp
 *.tar.gz
